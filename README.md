@@ -11,6 +11,8 @@ Backend Node.js (Render) per gestione notifiche push via Firebase Cloud Messagin
 - `POST /api/events/emit` (auth root/minister)
 - `POST /api/admin/send-notification` (auth root)
 - `POST /api/cron/remind-next-month-schedule` (header `x-cron-secret`)
+- `POST /api/cron/remind-service-songs-entry` (header `x-cron-secret`)
+- `POST /api/cron/remind-upcoming-service-members` (header `x-cron-secret`)
 
 ## Setup locale
 

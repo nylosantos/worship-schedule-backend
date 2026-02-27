@@ -15,6 +15,9 @@ const {
   FIREBASE_PROJECT_ID,
   FIREBASE_CLIENT_EMAIL,
   FIREBASE_PRIVATE_KEY,
+  REMINDER_MINISTER_DAYS_BEFORE = '3',
+  REMINDER_MUSICIANS_DAYS_BEFORE = '2',
+  WORSHIP_LEADER_POSITION_ID = 'ybW9FNApDIiZrTDH2fiX',
 } = process.env;
 
 if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
@@ -187,6 +190,42 @@ async function sendToUsers({ userIds, title, body, link, category }) {
   };
 }
 
+async function collectUserIdsByLinkedPersonIds(personIds) {
+  const cleanIds = [...new Set((personIds || []).map(String).filter(Boolean))];
+  if (!cleanIds.length) return [];
+  const chunks = [];
+  for (let i = 0; i < cleanIds.length; i += 10) {
+    chunks.push(cleanIds.slice(i, i + 10));
+  }
+
+  const recipients = [];
+  for (const group of chunks) {
+    const usersSnap = await db
+      .collection('users')
+      .where('active', '==', true)
+      .where('linkedPersonId', 'in', group)
+      .get();
+    recipients.push(...usersSnap.docs.map((d) => d.id));
+  }
+  return [...new Set(recipients)];
+}
+
+function assertCronSecret(req, res) {
+  const secret = req.headers['x-cron-secret'];
+  if (!CRON_SECRET || secret !== CRON_SECRET) {
+    res.status(401).send('Cron secret non valido');
+    return false;
+  }
+  return true;
+}
+
+function getISODateWithDaysOffset(daysBefore) {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() + daysBefore);
+  return date.toISOString().slice(0, 10);
+}
+
 app.post(
   '/api/admin/send-notification',
   authRequired,
@@ -257,12 +296,7 @@ app.post('/api/events/emit', authRequired, requireManageRole, async (req, res) =
       if (service) assignments = service.assignments || [];
     });
     const personIds = [...new Set(assignments.map((a) => a.personId).filter(Boolean))];
-    const usersSnap = await db
-      .collection('users')
-      .where('active', '==', true)
-      .where('linkedPersonId', 'in', personIds.slice(0, 10))
-      .get();
-    recipients = usersSnap.docs.map((d) => d.id);
+    recipients = await collectUserIdsByLinkedPersonIds(personIds);
     category = 'serviceSongs';
     title = 'Repertorio aggiornato';
     body = `Sono state aggiornate le canzoni del culto (${data.songsCount || 0}).`;
@@ -303,10 +337,7 @@ app.post('/api/events/emit', authRequired, requireManageRole, async (req, res) =
 });
 
 app.post('/api/cron/remind-next-month-schedule', async (req, res) => {
-  const secret = req.headers['x-cron-secret'];
-  if (!CRON_SECRET || secret !== CRON_SECRET) {
-    return res.status(401).send('Cron secret non valido');
-  }
+  if (!assertCronSecret(req, res)) return;
 
   const now = new Date();
   const nextMonthStart = new Date(now.getFullYear(), now.getMonth() + 1, 1);
@@ -344,6 +375,154 @@ app.post('/api/cron/remind-next-month-schedule', async (req, res) => {
   });
 
   res.json({ ok: true, month, recipients: recipients.length, ...result });
+});
+
+app.post('/api/cron/remind-service-songs-entry', async (req, res) => {
+  if (!assertCronSecret(req, res)) return;
+
+  const daysBefore = Number(REMINDER_MINISTER_DAYS_BEFORE) || 3;
+  const targetDate = getISODateWithDaysOffset(daysBefore);
+
+  const servicesSnap = await db
+    .collection('services')
+    .where('date', '==', targetDate)
+    .get();
+
+  if (servicesSnap.empty) {
+    return res.json({ ok: true, targetDate, checkedServices: 0, notifiedServices: 0 });
+  }
+
+  let notifiedServices = 0;
+  let totalRecipients = 0;
+  let totalSuccess = 0;
+  let totalFailure = 0;
+
+  for (const doc of servicesSnap.docs) {
+    const service = { id: doc.id, ...(doc.data() || {}) };
+    const songsSnap = await db
+      .collection('services')
+      .doc(service.id)
+      .collection('songs')
+      .limit(1)
+      .get();
+    if (!songsSnap.empty) continue;
+
+    const month = String(service.date || '').slice(0, 7);
+    const scheduleSnap = await db
+      .collection('schedules')
+      .where('month', '==', month)
+      .limit(1)
+      .get();
+
+    let recipients = [];
+    if (!scheduleSnap.empty) {
+      const schedule = scheduleSnap.docs[0].data();
+      const scheduleService = (schedule.services || []).find(
+        (s) => s.serviceId === service.id,
+      );
+      const worshipLeader = (scheduleService?.assignments || []).find(
+        (a) => a.positionId === WORSHIP_LEADER_POSITION_ID,
+      );
+      if (worshipLeader?.personId) {
+        recipients = await collectUserIdsByLinkedPersonIds([worshipLeader.personId]);
+      }
+    }
+
+    if (!recipients.length) {
+      const ministersSnap = await db
+        .collection('users')
+        .where('active', '==', true)
+        .where('role', '==', 'minister')
+        .get();
+      recipients = ministersSnap.docs.map((u) => u.id);
+    }
+
+    const result = await sendToUsers({
+      userIds: recipients,
+      title: 'Promemoria repertorio culto',
+      body: `Mancano le canzoni per il culto ${service.name} (${service.date} ${service.startTime}).`,
+      link: `/services/${service.id}`,
+      category: 'reminder',
+    });
+
+    notifiedServices += 1;
+    totalRecipients += recipients.length;
+    totalSuccess += result.success;
+    totalFailure += result.failure;
+  }
+
+  return res.json({
+    ok: true,
+    targetDate,
+    checkedServices: servicesSnap.size,
+    notifiedServices,
+    recipients: totalRecipients,
+    success: totalSuccess,
+    failure: totalFailure,
+  });
+});
+
+app.post('/api/cron/remind-upcoming-service-members', async (req, res) => {
+  if (!assertCronSecret(req, res)) return;
+
+  const daysBefore = Number(REMINDER_MUSICIANS_DAYS_BEFORE) || 2;
+  const targetDate = getISODateWithDaysOffset(daysBefore);
+
+  const servicesSnap = await db
+    .collection('services')
+    .where('date', '==', targetDate)
+    .get();
+
+  if (servicesSnap.empty) {
+    return res.json({ ok: true, targetDate, checkedServices: 0, notifiedServices: 0 });
+  }
+
+  let notifiedServices = 0;
+  let totalRecipients = 0;
+  let totalSuccess = 0;
+  let totalFailure = 0;
+
+  for (const doc of servicesSnap.docs) {
+    const service = { id: doc.id, ...(doc.data() || {}) };
+    const month = String(service.date || '').slice(0, 7);
+    const scheduleSnap = await db
+      .collection('schedules')
+      .where('month', '==', month)
+      .limit(1)
+      .get();
+    if (scheduleSnap.empty) continue;
+
+    const schedule = scheduleSnap.docs[0].data();
+    const scheduleService = (schedule.services || []).find(
+      (s) => s.serviceId === service.id,
+    );
+    const personIds = [...new Set((scheduleService?.assignments || []).map((a) => a.personId))];
+    const recipients = await collectUserIdsByLinkedPersonIds(personIds);
+    if (!recipients.length) continue;
+
+    const result = await sendToUsers({
+      userIds: recipients,
+      title: 'Promemoria culto in arrivo',
+      body: `Sei in scala per ${service.name} (${service.date} ${service.startTime}).`,
+      link: `/services/${service.id}`,
+      category: 'reminder',
+    });
+
+    notifiedServices += 1;
+    totalRecipients += recipients.length;
+    totalSuccess += result.success;
+    totalFailure += result.failure;
+  }
+
+  return res.json({
+    ok: true,
+    targetDate,
+    checkedServices: servicesSnap.size,
+    notifiedServices,
+    recipients: totalRecipients,
+    success: totalSuccess,
+    failure: totalFailure,
+  });
 });
 
 app.listen(PORT, () => {
