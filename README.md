@@ -21,6 +21,14 @@ Backend Node.js (Render) per gestione notifiche push via Firebase Cloud Messagin
 3. `npm install`
 4. `npm run dev`
 
+## Test notifica da terminale
+
+```bash
+npm run notify:test
+```
+
+Script interattivo con scelta destinatari, categoria, titolo, messaggio e link.
+
 ## Deploy Render
 
 - Runtime: Node 18+

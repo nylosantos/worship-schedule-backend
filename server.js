@@ -167,7 +167,6 @@ async function sendToUsers({ userIds, title, body, link, category }) {
   if (!tokens.length) return { success: 0, failure: 0 };
   const response = await messaging.sendEachForMulticast({
     tokens,
-    notification: { title, body },
     data: {
       title,
       body,
@@ -177,10 +176,6 @@ async function sendToUsers({ userIds, title, body, link, category }) {
     webpush: {
       fcmOptions: {
         link: link || APP_BASE_URL || '/',
-      },
-      notification: {
-        title,
-        body,
       },
     },
   });
